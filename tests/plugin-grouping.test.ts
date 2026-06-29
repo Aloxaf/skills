@@ -69,4 +69,28 @@ describe('getPluginGroupings', () => {
 
     expect(groupings.get(expectedPath)).toBe('nested-plugin');
   });
+
+  it('should map skills discovered from a plugin.json skills directory', async () => {
+    const dirManifestDir = join(TEST_DIR, 'directory-manifest');
+    await mkdir(join(dirManifestDir, '.claude-plugin'), { recursive: true });
+    await mkdir(join(dirManifestDir, 'skills/first-skill'), { recursive: true });
+    await mkdir(join(dirManifestDir, 'skills/second-skill'), { recursive: true });
+    await writeFile(
+      join(dirManifestDir, '.claude-plugin/plugin.json'),
+      JSON.stringify({
+        name: 'directory-plugin',
+        skills: './skills',
+      })
+    );
+    await writeFile(join(dirManifestDir, 'skills/first-skill/SKILL.md'), '---\nname: first\n---\n');
+    await writeFile(
+      join(dirManifestDir, 'skills/second-skill/SKILL.md'),
+      '---\nname: second\n---\n'
+    );
+
+    const groupings = await getPluginGroupings(dirManifestDir);
+
+    expect(groupings.get(resolve(dirManifestDir, 'skills/first-skill'))).toBe('directory-plugin');
+    expect(groupings.get(resolve(dirManifestDir, 'skills/second-skill'))).toBe('directory-plugin');
+  });
 });

@@ -1,4 +1,4 @@
-import { readFile } from 'fs/promises';
+import { readFile, readdir, stat } from 'fs/promises';
 import { join, dirname, resolve, normalize, sep } from 'path';
 
 /**
@@ -24,7 +24,7 @@ function isValidRelativePath(path: string): boolean {
  */
 interface PluginManifestEntry {
   source?: string | { source: string; repo?: string };
-  skills?: string[];
+  skills?: string | string[];
   /** Optional name for grouping skills (e.g., "document-skills") */
   name?: string;
 }
@@ -35,8 +35,16 @@ interface MarketplaceManifest {
 }
 
 interface PluginManifest {
-  skills?: string[];
+  skills?: string | string[];
   name?: string;
+}
+
+async function hasSkillMd(skillDir: string): Promise<boolean> {
+  try {
+    return (await stat(join(skillDir, 'SKILL.md'))).isFile();
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -53,11 +61,11 @@ export async function getPluginSkillPaths(basePath: string): Promise<string[]> {
 
   // Helper: add skill paths for a plugin at a given base path
   // Only adds paths that are contained within basePath (security: prevents traversal)
-  const addPluginSkillPaths = (pluginBase: string, skills?: string[]) => {
+  const addPluginSkillPaths = (pluginBase: string, skills?: string | string[]) => {
     // Validate pluginBase itself is contained
     if (!isContainedIn(pluginBase, basePath)) return;
 
-    if (skills && skills.length > 0) {
+    if (Array.isArray(skills) && skills.length > 0) {
       // Plugin explicitly declares skill paths - add parent dirs so existing loop finds them
       for (const skillPath of skills) {
         // Validate skill path starts with './' (per Claude Code convention)
@@ -66,6 +74,15 @@ export async function getPluginSkillPaths(basePath: string): Promise<string[]> {
         const skillDir = dirname(join(pluginBase, skillPath));
         if (isContainedIn(skillDir, basePath)) {
           searchDirs.push(skillDir);
+        }
+      }
+    } else if (typeof skills === 'string') {
+      // Some plugin manifests declare a directory containing skills instead
+      // of enumerating every skill directory.
+      if (isValidRelativePath(skills)) {
+        const skillContainerDir = join(pluginBase, skills);
+        if (isContainedIn(skillContainerDir, basePath)) {
+          searchDirs.push(skillContainerDir);
         }
       }
     }
@@ -120,6 +137,75 @@ export async function getPluginSkillPaths(basePath: string): Promise<string[]> {
 export async function getPluginGroupings(basePath: string): Promise<Map<string, string>> {
   const groupings = new Map<string, string>();
 
+  const addSkillDirectoryGrouping = async (skillDir: string, pluginName: string) => {
+    if (!isContainedIn(skillDir, basePath)) return;
+    if (await hasSkillMd(skillDir)) {
+      groupings.set(resolve(skillDir), pluginName);
+    }
+  };
+
+  const addSkillContainerGroupings = async (skillContainerDir: string, pluginName: string) => {
+    if (!isContainedIn(skillContainerDir, basePath)) return;
+
+    try {
+      const entries = await readdir(skillContainerDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+
+        const childDir = join(skillContainerDir, entry.name);
+        if (!isContainedIn(childDir, basePath)) continue;
+
+        if (await hasSkillMd(childDir)) {
+          groupings.set(resolve(childDir), pluginName);
+          continue;
+        }
+
+        // Match discoverSkills' catalog behavior for layouts like
+        // skills/<category>/<skill>/SKILL.md.
+        try {
+          const grandEntries = await readdir(childDir, { withFileTypes: true });
+          for (const grandEntry of grandEntries) {
+            if (!grandEntry.isDirectory()) continue;
+            await addSkillDirectoryGrouping(join(childDir, grandEntry.name), pluginName);
+          }
+        } catch {
+          // Child dir unreadable; skip silently.
+        }
+      }
+    } catch {
+      // Directory doesn't exist or is unreadable.
+    }
+  };
+
+  const addPluginGroupings = async (
+    pluginBase: string,
+    pluginName: string,
+    skills?: string | string[]
+  ) => {
+    if (!isContainedIn(pluginBase, basePath)) return;
+
+    if (Array.isArray(skills) && skills.length > 0) {
+      for (const skillPath of skills) {
+        // Validate skill path starts with './' (per Claude Code convention)
+        if (!isValidRelativePath(skillPath)) continue;
+
+        const skillDir = join(pluginBase, skillPath);
+        if (isContainedIn(skillDir, basePath)) {
+          groupings.set(resolve(skillDir), pluginName);
+        }
+      }
+      return;
+    }
+
+    if (typeof skills === 'string') {
+      if (!isValidRelativePath(skills)) return;
+      await addSkillContainerGroupings(join(pluginBase, skills), pluginName);
+      return;
+    }
+
+    await addSkillContainerGroupings(join(pluginBase, 'skills'), pluginName);
+  };
+
   // Try marketplace.json (multi-plugin catalog)
   try {
     const content = await readFile(join(basePath, '.claude-plugin/marketplace.json'), 'utf-8');
@@ -144,18 +230,7 @@ export async function getPluginGroupings(basePath: string): Promise<Map<string, 
         // Validate pluginBase itself is contained
         if (!isContainedIn(pluginBase, basePath)) continue;
 
-        if (plugin.skills && plugin.skills.length > 0) {
-          for (const skillPath of plugin.skills) {
-            // Validate skill path starts with './' (per Claude Code convention)
-            if (!isValidRelativePath(skillPath)) continue;
-
-            const skillDir = join(pluginBase, skillPath);
-            if (isContainedIn(skillDir, basePath)) {
-              // Store absolute path as key for reliable matching
-              groupings.set(resolve(skillDir), plugin.name);
-            }
-          }
-        }
+        await addPluginGroupings(pluginBase, plugin.name, plugin.skills);
       }
     }
   } catch {
@@ -166,14 +241,8 @@ export async function getPluginGroupings(basePath: string): Promise<Map<string, 
   try {
     const content = await readFile(join(basePath, '.claude-plugin/plugin.json'), 'utf-8');
     const manifest: PluginManifest = JSON.parse(content);
-    if (manifest.name && manifest.skills && manifest.skills.length > 0) {
-      for (const skillPath of manifest.skills) {
-        if (!isValidRelativePath(skillPath)) continue;
-        const skillDir = join(basePath, skillPath);
-        if (isContainedIn(skillDir, basePath)) {
-          groupings.set(resolve(skillDir), manifest.name);
-        }
-      }
+    if (manifest.name) {
+      await addPluginGroupings(basePath, manifest.name, manifest.skills);
     }
   } catch {
     // File doesn't exist or invalid JSON

@@ -110,6 +110,32 @@ description: Test
     expect(skills[0].name).toBe('single-plugin-skill');
   });
 
+  it('should discover and group skills when plugin.json declares a skills directory', async () => {
+    mkdirSync(join(testDir, '.claude-plugin'), { recursive: true });
+    writeFileSync(
+      join(testDir, '.claude-plugin/plugin.json'),
+      JSON.stringify({
+        name: 'directory-plugin',
+        skills: './skills',
+      })
+    );
+
+    mkdirSync(join(testDir, 'skills/directory-skill'), { recursive: true });
+    writeFileSync(
+      join(testDir, 'skills/directory-skill/SKILL.md'),
+      `---
+name: directory-skill
+description: Test
+---
+`
+    );
+
+    const skills = await discoverSkills(testDir);
+    expect(skills).toHaveLength(1);
+    expect(skills[0].name).toBe('directory-skill');
+    expect(skills[0].pluginName).toBe('directory-plugin');
+  });
+
   it('should skip remote source objects', async () => {
     mkdirSync(join(testDir, '.claude-plugin'), { recursive: true });
     writeFileSync(
