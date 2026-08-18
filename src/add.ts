@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import * as p from '@clack/prompts';
 import pc from 'picocolors';
 import { existsSync } from 'fs';
@@ -7,30 +6,6 @@ import { sep, join, dirname } from 'path';
 import { parseSource, getOwnerRepo, parseOwnerRepo, isRepoPrivate } from './source-parser.ts';
 import { stripTerminalEscapes } from './sanitize.ts';
 import { searchMultiselect } from './prompts/search-multiselect.ts';
-
-// Helper to check if a value is a cancel symbol (works with both clack and our custom prompts)
-const isCancelled = (value: unknown): value is symbol => typeof value === 'symbol';
-
-/**
- * Check if a source identifier (owner/repo format) represents a private GitHub repo.
- * Returns true if private, false if public, null if unable to determine or not a GitHub repo.
- */
-async function isSourcePrivate(source: string): Promise<boolean | null> {
-  const ownerRepo = parseOwnerRepo(source);
-  if (!ownerRepo) {
-    // Not in owner/repo format, assume not private (could be other providers)
-    return false;
-  }
-  return isRepoPrivate(ownerRepo.owner, ownerRepo.repo);
-}
-
-export function getLockSource(parsedUrl: string, normalizedSource: string | null): string | null {
-  // Preserve SSH URLs in lock files instead of normalizing to owner/repo shorthand.
-  // When normalizedSource is used, parseSource() later resolves it to HTTPS,
-  // breaking restore for private repos that require SSH authentication.
-  const isSSH = parsedUrl.startsWith('git@') || parsedUrl.startsWith('ssh://');
-  return isSSH ? parsedUrl : normalizedSource;
-}
 import { cloneRepo, cleanupTempDir, GitCloneError } from './git.ts';
 import { discoverSkills, getSkillDisplayName, filterSkills } from './skills.ts';
 import {
@@ -58,10 +33,14 @@ import {
   type PartnerAudit,
 } from './telemetry.ts';
 import { detectAgent, getAgentType } from './detect-agent.ts';
-import { wellKnownProvider, type WellKnownSkill } from './providers/index.ts';
+import {
+  wellKnownProvider,
+  computeWellKnownSkillDigest,
+  type WellKnownSkill,
+} from './providers/index.ts';
+import { downloadSource } from './download-source.ts';
 import {
   addSkillToLock,
-  fetchSkillFolderHash,
   getGitHubToken,
   isPromptDismissed,
   dismissPrompt,
@@ -79,6 +58,47 @@ import {
   type BlobInstallResult,
 } from './blob.ts';
 import packageJson from '../package.json' with { type: 'json' };
+
+// Helper to check if a value is a cancel symbol (works with both clack and our custom prompts)
+const isCancelled = (value: unknown): value is symbol => typeof value === 'symbol';
+const EVE_AGENT_LABEL = 'eve agent';
+
+/**
+ * Check if a source identifier (owner/repo format) represents a private GitHub repo.
+ * Returns true if private, false if public, null if unable to determine or not a GitHub repo.
+ */
+async function isSourcePrivate(source: string): Promise<boolean | null> {
+  const ownerRepo = parseOwnerRepo(source);
+  if (!ownerRepo) {
+    // Not in owner/repo format, assume not private (could be other providers)
+    return false;
+  }
+  return isRepoPrivate(ownerRepo.owner, ownerRepo.repo);
+}
+
+export function getLockSource(parsedUrl: string, normalizedSource: string | null): string | null {
+  // Preserve SSH URLs in lock files instead of normalizing to owner/repo shorthand.
+  // When normalizedSource is used, parseSource() later resolves it to HTTPS,
+  // breaking restore for private repos that require SSH authentication.
+  const isSSH = parsedUrl.startsWith('git@') || parsedUrl.startsWith('ssh://');
+  if (isSSH) {
+    return parsedUrl;
+  }
+  if (parsedUrl.startsWith('http://') || parsedUrl.startsWith('https://')) {
+    try {
+      if (new URL(parsedUrl).hostname !== 'github.com') {
+        return parsedUrl;
+      }
+    } catch {
+      return normalizedSource;
+    }
+  }
+  return normalizedSource;
+}
+
+export function getProjectLockSourceUrl(sourceType: string, sourceUrl: string): string | undefined {
+  return sourceType === 'git' || sourceType === 'gitlab' ? sourceUrl : undefined;
+}
 export function initTelemetry(version: string): void {
   setVersion(version);
 }
@@ -184,13 +204,6 @@ function shortenPath(fullPath: string, cwd: string): string {
   return fullPath;
 }
 
-function computeSingleFileSkillHash(contents: string): string {
-  const hash = createHash('sha256');
-  hash.update('SKILL.md');
-  hash.update(contents);
-  return hash.digest('hex');
-}
-
 /**
  * Formats a list of items, truncating if too many
  */
@@ -201,6 +214,18 @@ function formatList(items: string[], maxShow: number = 5): string {
   const shown = items.slice(0, maxShow);
   const remaining = items.length - maxShow;
   return `${shown.join(', ')} +${remaining} more`;
+}
+
+function formatSkillPromptSubject(skills: Skill[]): string {
+  const names = skills.map((skill) => pc.cyan(getSkillDisplayName(skill)));
+  const namedSubject = formatList(names, 3);
+  return stripTerminalEscapes(namedSubject).length <= 80
+    ? namedSubject
+    : `${skills.length} selected skills`;
+}
+
+export function formatEveInstallPromptMessage(skills: Skill[]): string {
+  return `Detected an eve project. Install ${formatSkillPromptSubject(skills)} for your ${EVE_AGENT_LABEL} to use?`;
 }
 
 /**
@@ -517,11 +542,12 @@ export interface AddOptions {
   agent?: string[];
   yes?: boolean;
   skill?: string[];
+  /** Valid JSON to attach to the install telemetry event. */
+  metadata?: string;
   list?: boolean;
   all?: boolean;
   fullDepth?: boolean;
   copy?: boolean;
-  dangerouslyAcceptOpenclawRisks?: boolean;
   /**
    * Eve subagent targets. Each value is a subagent name; `root` (or `.`)
    * selects the root agent. Implies installing for Eve.
@@ -534,25 +560,30 @@ export interface AddOptions {
  * Discovers skills from /.well-known/agent-skills/index.json (preferred)
  * or /.well-known/skills/index.json (legacy fallback).
  */
+function isSkillsShPackUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    const hostname = parsed.hostname.replace(/^www\./, '');
+    return hostname === 'skills.sh' && /^\/p\/[^/]+/.test(parsed.pathname);
+  } catch {
+    return false;
+  }
+}
+
 async function handleWellKnownSkills(
   source: string,
   url: string,
   options: AddOptions,
   spinner: ReturnType<typeof p.spinner>
-): Promise<void> {
+): Promise<boolean> {
   spinner.start('Discovering skills from well-known endpoint...');
 
   // Fetch all skills from the well-known endpoint
-  const skills = await wellKnownProvider.fetchAllSkills(url);
+  const skills = await wellKnownProvider.fetchAllSkills(url).catch(() => []);
 
   if (skills.length === 0) {
-    spinner.stop(pc.red('No skills found'));
-    p.outro(
-      pc.red(
-        'No skills found at this URL. Make sure the server has a /.well-known/agent-skills/index.json or /.well-known/skills/index.json file.'
-      )
-    );
-    process.exit(1);
+    spinner.stop(pc.dim('No well-known skills found; trying direct download...'));
+    return false;
   }
 
   spinner.stop(`Found ${pc.green(skills.length)} skill${skills.length > 1 ? 's' : ''}`);
@@ -617,12 +648,13 @@ async function handleWellKnownSkills(
     const skillChoices = skills.map((s) => ({
       value: s,
       label: s.installName,
-      hint: s.description.length > 60 ? s.description.slice(0, 57) + '...' : s.description,
+      hint: s.description.length > 60 ? s.description.slice(0, 57) + '…' : s.description,
     }));
 
     const selected = await multiselect({
       message: 'Select skills to install',
       options: skillChoices,
+      initialValues: isSkillsShPackUrl(url) ? skills : undefined,
       required: true,
     });
 
@@ -653,7 +685,7 @@ async function handleWellKnownSkills(
 
     targetAgents = options.agent as AgentType[];
   } else {
-    spinner.start('Loading agents...');
+    spinner.start('Loading agents…');
     const installedAgents = await detectInstalledAgents();
     const totalAgents = Object.keys(agents).length;
     spinner.stop(`${totalAgents} agents`);
@@ -828,7 +860,7 @@ async function handleWellKnownSkills(
   const sourceIdentifier = wellKnownProvider.getSourceIdentifier(url);
   const wellKnownPrivacyPromise = isSourcePrivate(sourceIdentifier).catch(() => null);
 
-  spinner.start('Installing skills...');
+  spinner.start('Installing skills…');
 
   const results: {
     skill: string;
@@ -877,6 +909,8 @@ async function handleWellKnownSkills(
       agents: targetAgents.join(','),
       ...(installGlobally && { global: '1' }),
       skillFiles: JSON.stringify(skillFiles),
+      installUrl: url,
+      metadata: options.metadata,
       sourceType: 'well-known',
     });
   }
@@ -891,7 +925,9 @@ async function handleWellKnownSkills(
             source: sourceIdentifier,
             sourceType: 'well-known',
             sourceUrl: skill.sourceUrl,
-            skillFolderHash: '', // Well-known skills don't have a folder hash
+            skillFolderHash: '',
+            sourceBaseUrl: url,
+            wellKnownDigest: computeWellKnownSkillDigest(skill),
           });
         } catch {
           // Don't fail installation if lock file update fails
@@ -914,8 +950,10 @@ async function handleWellKnownSkills(
               skill.installName,
               {
                 source: sourceIdentifier,
+                sourceUrl: url,
                 sourceType: 'well-known',
                 computedHash,
+                wellKnownDigest: computeWellKnownSkillDigest(skill),
               },
               cwd
             );
@@ -946,9 +984,13 @@ async function handleWellKnownSkills(
       if (firstResult.mode === 'copy') {
         // Copy mode: show skill name and list all agent paths
         resultLines.push(`${pc.green('✓')} ${skillName} ${pc.dim('(copied)')}`);
+        const shortPathsSet = new Set<string>();
         for (const r of skillResults) {
           const shortPath = shortenPath(r.path, cwd);
-          resultLines.push(`  ${pc.dim('→')} ${shortPath}`);
+          if (!shortPathsSet.has(shortPath)) {
+            shortPathsSet.add(shortPath);
+            resultLines.push(`  ${pc.dim('→')} ${shortPath}`);
+          }
         }
       } else {
         // Symlink mode: show canonical path and universal/symlinked agents
@@ -991,6 +1033,7 @@ async function handleWellKnownSkills(
 
   // Prompt for find-skills after successful install
   await promptForFindSkills(options, targetAgents);
+  return true;
 }
 
 export async function runAdd(args: string[], options: AddOptions = {}): Promise<void> {
@@ -1060,8 +1103,9 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
   try {
     const spinner = p.spinner();
 
-    spinner.start('Parsing source...');
+    spinner.start('Parsing source…');
     const parsed = parseSource(source);
+    let directDownload = parsed.type === 'download';
     spinner.stop(
       `Source: ${parsed.type === 'local' ? parsed.localPath! : parsed.url}${parsed.ref ? ` @ ${pc.yellow(parsed.ref)}` : ''}${parsed.subpath ? ` (${parsed.subpath})` : ''}${parsed.skillFilter ? ` ${pc.dim('@')}${pc.cyan(parsed.skillFilter)}` : ''}`
     );
@@ -1069,37 +1113,24 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
     // Kick off the repo privacy check early so it runs in parallel with
     // cloning/discovering/installing. The result is only needed later for
     // telemetry gating — it should never block user-visible output.
-    const ownerRepoRaw = getOwnerRepo(parsed);
+    const ownerRepoRaw =
+      parsed.type === 'well-known' || parsed.type === 'download' ? null : getOwnerRepo(parsed);
     const repoPrivacyPromise: Promise<boolean | null> = (() => {
+      // The privacy endpoint below is GitHub.com-specific. In particular, do
+      // not send GitHub Enterprise repository names to the public API.
+      if (parsed.type !== 'github') return Promise.resolve(null);
       if (!ownerRepoRaw) return Promise.resolve(null);
       const ownerRepo = parseOwnerRepo(ownerRepoRaw);
       if (!ownerRepo) return Promise.resolve(null);
       return isRepoPrivate(ownerRepo.owner, ownerRepo.repo).catch(() => null);
     })();
 
-    // Block openclaw sources unless explicitly opted in
-    const sourceOwner = ownerRepoRaw?.split('/')[0]?.toLowerCase();
-    if (sourceOwner === 'openclaw' && !options.dangerouslyAcceptOpenclawRisks) {
-      console.log();
-      p.log.warn(pc.yellow(pc.bold('⚠ OpenClaw skills are unverified community submissions.')));
-      p.log.message(
-        pc.yellow(
-          'This source contains user-submitted skills that have not been reviewed for safety or quality.'
-        )
-      );
-      p.log.message(pc.yellow('Skills run with full agent permissions and could be malicious.'));
-      console.log();
-      p.log.message(
-        `If you understand the risks, re-run with:\n\n  ${pc.cyan(`npx skills add ${source} --dangerously-accept-openclaw-risks`)}\n`
-      );
-      p.outro(pc.red('Installation blocked'));
-      process.exit(1);
-    }
-
-    // Handle well-known skills from arbitrary URLs
+    // Handle arbitrary URLs by trying well-known discovery first, then
+    // falling back to a direct SKILL.md/archive download.
     if (parsed.type === 'well-known') {
-      await handleWellKnownSkills(source, parsed.url, options, spinner);
-      return;
+      const handled = await handleWellKnownSkills(source, parsed.url, options, spinner);
+      if (handled) return;
+      directDownload = true;
     }
 
     // If skillFilter is present from @skill syntax (e.g., owner/repo@skill-name),
@@ -1120,7 +1151,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
 
     if (parsed.type === 'local') {
       // Use local path directly, no cloning needed
-      spinner.start('Validating local path...');
+      spinner.start('Validating local path…');
       if (!existsSync(parsed.localPath!)) {
         spinner.stop(pc.red('Path not found'));
         p.outro(pc.red(`Local path does not exist: ${parsed.localPath}`));
@@ -1128,8 +1159,19 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       }
       spinner.stop('Local path validated');
 
-      spinner.start('Discovering skills...');
+      spinner.start('Discovering skills…');
       skills = await discoverSkills(parsed.localPath!, parsed.subpath, {
+        includeInternal,
+        fullDepth: options.fullDepth,
+      });
+    } else if (parsed.type === 'well-known' || parsed.type === 'download') {
+      spinner.start('Downloading source...');
+      const downloaded = await downloadSource(parsed.url);
+      tempDir = downloaded.tempDir;
+      spinner.stop(`Downloaded ${downloaded.kind === 'skill-md' ? 'SKILL.md file' : 'archive'}`);
+
+      spinner.start('Discovering skills...');
+      skills = await discoverSkills(downloaded.rootDir, parsed.subpath, {
         includeInternal,
         fullDepth: options.fullDepth,
       });
@@ -1143,7 +1185,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       const isSelfHostedRepo =
         !!ownerRepo && Object.hasOwn(BLOB_ALLOWED_REPOS, ownerRepo.toLowerCase());
       if (ownerRepo && owner && (isSelfHostedRepo || BLOB_ALLOWED_OWNERS.includes(owner))) {
-        spinner.start('Fetching skills...');
+        spinner.start('Fetching skills…');
         blobResult = await tryBlobInstall(ownerRepo, {
           subpath: parsed.subpath,
           skillFilter: parsed.skillFilter,
@@ -1152,7 +1194,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
           includeInternal,
         });
         if (!blobResult) {
-          spinner.stop(pc.dim('Falling back to clone...'));
+          spinner.stop(pc.dim('Falling back to clone…'));
         }
       }
 
@@ -1161,11 +1203,11 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
         spinner.stop(`Found ${pc.green(skills.length)} skill${skills.length > 1 ? 's' : ''}`);
       } else {
         // Blob failed — fall back to git clone
-        spinner.start('Cloning repository...');
+        spinner.start('Cloning repository…');
         tempDir = await cloneRepo(parsed.url, parsed.ref);
         spinner.stop('Repository cloned');
 
-        spinner.start('Discovering skills...');
+        spinner.start('Discovering skills…');
         skills = await discoverSkills(tempDir, parsed.subpath, {
           includeInternal,
           fullDepth: options.fullDepth,
@@ -1173,11 +1215,11 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       }
     } else {
       // GitLab, git URL, or --full-depth: always clone
-      spinner.start('Cloning repository...');
+      spinner.start('Cloning repository…');
       tempDir = await cloneRepo(parsed.url, parsed.ref);
       spinner.stop('Repository cloned');
 
-      spinner.start('Discovering skills...');
+      spinner.start('Discovering skills…');
       skills = await discoverSkills(tempDir, parsed.subpath, {
         includeInternal,
         fullDepth: options.fullDepth,
@@ -1291,47 +1333,33 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       // Check if any skills have plugin grouping
       const hasGroups = sortedSkills.some((s) => s.pluginName);
 
-      let selected: Skill[] | symbol;
+      const kebabToTitle = (s: string) =>
+        s
+          .split('-')
+          .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+          .join(' ');
 
-      if (hasGroups) {
-        // Build grouped options for groupMultiselect
-        const kebabToTitle = (s: string) =>
-          s
-            .split('-')
-            .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-            .join(' ');
+      const skillChoices = sortedSkills.map((s) => ({
+        value: s,
+        label: getSkillDisplayName(s),
+        group: hasGroups ? (s.pluginName ? kebabToTitle(s.pluginName) : 'Other') : undefined,
+        detail: s.description,
+      }));
 
-        const grouped: Record<string, p.Option<Skill>[]> = {};
-        for (const s of sortedSkills) {
-          const groupName = s.pluginName ? kebabToTitle(s.pluginName) : 'Other';
-          if (!grouped[groupName]) grouped[groupName] = [];
-          grouped[groupName]!.push({
-            value: s,
-            label: getSkillDisplayName(s),
-            hint: s.description.length > 60 ? s.description.slice(0, 57) + '...' : s.description,
-          });
-        }
+      const selected = await searchMultiselect({
+        message: hasGroups
+          ? `Select skills to install ${pc.dim('(space to toggle)')}`
+          : 'Select skills to install',
+        items: skillChoices,
+        required: true,
+        maxVisible: 20,
+        searchable: !hasGroups,
+        showDetail: true,
+        showSelectedSummary: false,
+        selectGroups: hasGroups,
+      });
 
-        selected = await p.groupMultiselect({
-          message: `Select skills to install ${pc.dim('(space to toggle)')}`,
-          options: grouped,
-          required: true,
-        });
-      } else {
-        const skillChoices = sortedSkills.map((s) => ({
-          value: s,
-          label: getSkillDisplayName(s),
-          hint: s.description.length > 60 ? s.description.slice(0, 57) + '...' : s.description,
-        }));
-
-        selected = await multiselect({
-          message: 'Select skills to install',
-          options: skillChoices,
-          required: true,
-        });
-      }
-
-      if (p.isCancel(selected)) {
+      if (isCancelled(selected)) {
         p.cancel('Installation cancelled');
         await cleanup(tempDir);
         process.exit(0);
@@ -1340,13 +1368,18 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       selectedSkills = selected as Skill[];
     }
 
-    // Kick off security audit fetch early (non-blocking) so it runs
-    // in parallel with agent selection, scope, and mode prompts.
+    // Kick off the security audit only after GitHub has positively confirmed
+    // that this is a public repository. Private and unknown repositories must
+    // not send their names or skill names to the audit service.
     const ownerRepoForAudit = getOwnerRepo(parsed);
     const auditPromise = ownerRepoForAudit
-      ? fetchAuditData(
-          ownerRepoForAudit,
-          selectedSkills.map((s) => getSkillDisplayName(s))
+      ? repoPrivacyPromise.then((isPrivate) =>
+          isPrivate === false
+            ? fetchAuditData(
+                ownerRepoForAudit,
+                selectedSkills.map((s) => getSkillDisplayName(s))
+              )
+            : null
         )
       : Promise.resolve(null);
 
@@ -1369,7 +1402,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
 
       targetAgents = options.agent as AgentType[];
     } else {
-      spinner.start('Loading agents...');
+      spinner.start('Loading agents…');
       const installedAgents = await detectInstalledAgents();
       const totalAgents = Object.keys(agents).length;
       spinner.stop(`${totalAgents} agents`);
@@ -1378,7 +1411,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
         const useEve = options.yes
           ? true
           : await p.confirm({
-              message: 'Detected an Eve project. Install skills for Eve?',
+              message: formatEveInstallPromptMessage(selectedSkills),
               initialValue: true,
             });
 
@@ -1390,7 +1423,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
 
         if (useEve) {
           targetAgents = ['eve'];
-          p.log.info(`Installing to: ${pc.cyan(agents.eve.displayName)}`);
+          p.log.info(`Installing to: ${pc.cyan(EVE_AGENT_LABEL)}`);
         } else {
           const selected = await selectAgentsInteractive({ global: options.global });
 
@@ -1695,7 +1728,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       }
     }
 
-    spinner.start('Installing skills...');
+    spinner.start('Installing skills…');
 
     const results: {
       skill: string;
@@ -1721,15 +1754,12 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
             agent,
             { global: installGlobally, mode: installMode, eveSubagent: subagent }
           );
-        } else if (tempDir && skill.path === tempDir && skill.rawContent) {
-          // Remote root-level SKILL.md: install the skill file, not the whole repository.
-          result = await installBlobSkillForAgent(
-            { installName: skill.name, files: [{ path: 'SKILL.md', contents: skill.rawContent }] },
-            agent,
-            { global: installGlobally, mode: installMode }
-          );
         } else {
-          // Disk-based install: copy from cloned/local directory
+          // Disk-based install: copy from cloned/local directory.
+          // Root-level skills (SKILL.md at repo root, so skill.path === tempDir)
+          // also take this path and are copied recursively (see installer.ts
+          // copyDirectory, which excludes .git), so their scripts/, references/,
+          // assets/, etc. are installed too. See issue #1603.
           result = await installSkillForAgent(skill, agent, {
             global: installGlobally,
             mode: installMode,
@@ -1775,9 +1805,12 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
     }
 
     // Normalize source to owner/repo format for telemetry
-    const normalizedSource = getOwnerRepo(parsed);
+    const normalizedSource = directDownload ? null : getOwnerRepo(parsed);
 
-    const lockSource = getLockSource(parsed.url, normalizedSource);
+    const lockSource = directDownload ? null : getLockSource(parsed.url, normalizedSource);
+    const projectLockSourceUrl = directDownload
+      ? undefined
+      : getProjectLockSourceUrl(parsed.type, parsed.url);
 
     // Only track if we have a valid remote source and it's not a private repo.
     // repoPrivacyPromise was started early (right after parsing) so it has
@@ -1796,6 +1829,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
             agents: targetAgents.join(','),
             ...(installGlobally && { global: '1' }),
             skillFiles: JSON.stringify(skillFiles),
+            metadata: options.metadata,
           });
         }
       } else {
@@ -1807,6 +1841,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
           agents: targetAgents.join(','),
           ...(installGlobally && { global: '1' }),
           skillFiles: JSON.stringify(skillFiles),
+          metadata: options.metadata,
         });
       }
     }
@@ -1858,7 +1893,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
     }
 
     // Add to local lock file for project-scoped installs
-    if (successful.length > 0 && !installGlobally) {
+    if (successful.length > 0 && !installGlobally && !directDownload) {
       const successfulSkillNames = new Set(successful.map((r) => r.skill));
       // Record Eve subagent placement (root = '') so `update` can restore it.
       // Only meaningful when Eve is among the targets and a non-root subagent
@@ -1876,14 +1911,13 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
             const computedHash =
               blobResult && 'snapshotHash' in skill
                 ? (skill as BlobSkill).snapshotHash
-                : tempDir && skill.path === tempDir && skill.rawContent
-                  ? computeSingleFileSkillHash(skill.rawContent)
-                  : await computeSkillFolderHash(skill.path);
+                : await computeSkillFolderHash(skill.path);
             const skillPathValue = skillFiles[skill.name];
             await addSkillToLocalLock(
               skill.name,
               {
                 source: lockSource || parsed.url,
+                ...(projectLockSourceUrl && { sourceUrl: projectLockSourceUrl }),
                 ref: parsed.ref,
                 sourceType: parsed.type,
                 ...(skillPathValue && { skillPath: skillPathValue }),
@@ -1937,9 +1971,13 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
           if (firstResult.mode === 'copy') {
             // Copy mode: show skill name and list all agent paths
             resultLines.push(`${pc.green('✓')} ${entry.skill} ${pc.dim('(copied)')}`);
+            const shortPathsSet = new Set<string>();
             for (const r of skillResults) {
               const shortPath = shortenPath(r.path, cwd);
-              resultLines.push(`  ${pc.dim('→')} ${shortPath}`);
+              if (!shortPathsSet.has(shortPath)) {
+                shortPathsSet.add(shortPath);
+                resultLines.push(`  ${pc.dim('→')} ${shortPath}`);
+              }
             }
           } else {
             // Symlink mode: show canonical path and universal/symlinked agents
@@ -2084,7 +2122,7 @@ async function promptForFindSkills(
       }
 
       console.log();
-      p.log.step('Installing find-skills skill...');
+      p.log.step('Installing find-skills skill…');
 
       try {
         // Call runAdd directly
@@ -2111,9 +2149,14 @@ async function promptForFindSkills(
 }
 
 // Parse command line options from args array
-export function parseAddOptions(args: string[]): { source: string[]; options: AddOptions } {
+export function parseAddOptions(args: string[]): {
+  source: string[];
+  options: AddOptions;
+  errors: string[];
+} {
   const options: AddOptions = {};
   const source: string[] = [];
+  const errors: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -2146,6 +2189,18 @@ export function parseAddOptions(args: string[]): { source: string[]; options: Ad
         nextArg = args[i];
       }
       i--; // Back up one since the loop will increment
+    } else if (arg === '--metadata') {
+      const metadata = args[++i];
+      if (metadata === undefined) {
+        errors.push('--metadata requires a JSON value');
+      } else {
+        try {
+          JSON.parse(metadata);
+          options.metadata = metadata;
+        } catch {
+          errors.push('--metadata must be valid JSON');
+        }
+      }
     } else if (arg === '--full-depth') {
       options.fullDepth = true;
     } else if (arg === '--copy') {
@@ -2160,12 +2215,10 @@ export function parseAddOptions(args: string[]): { source: string[]; options: Ad
         nextArg = args[i];
       }
       i--; // Back up one since the loop will increment
-    } else if (arg === '--dangerously-accept-openclaw-risks') {
-      options.dangerouslyAcceptOpenclawRisks = true;
     } else if (arg && !arg.startsWith('-')) {
       source.push(arg);
     }
   }
 
-  return { source, options };
+  return { source, options, errors };
 }
